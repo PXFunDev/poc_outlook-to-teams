@@ -1,0 +1,21 @@
+[project]
+name = "outlook-to-teams-poc"
+version = "0.1.0"
+description = "Outlookの指定フォルダーに追加されたメールをTeamsへ転送するPoC"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pywin32>=308; sys_platform == 'win32'",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.9",
+]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "D"]
+# 日本語の句点を使うため、英語の文末記号を要求するルールは適用しない。
+ignore = ["D203", "D213", "D400", "D415"]
