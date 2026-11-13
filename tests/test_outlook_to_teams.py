@@ -8,10 +8,15 @@ from unittest.mock import Mock, patch
 import outlook_to_teams as app
 
 TARGET = "channel@example.com"
+SENDER = "personal@example.com"
 
 
 class ForwardingTests(unittest.TestCase):
     """メール転送とフォルダー操作を検証する。"""
+
+    def setUp(self):
+        """送信元の個人用アカウントを用意する。"""
+        self.sender = Mock(SmtpAddress=SENDER)
 
     def test_existing_and_non_mail_items_are_skipped(self):
         """起動時のメールとメール以外を除外し、新規メールだけを転送する。"""
@@ -21,7 +26,9 @@ class ForwardingTests(unittest.TestCase):
         folder = Mock(Items=[existing, other, new])
         excluded = {"existing"}
 
-        self.assertEqual(app.forward_new_messages(folder, excluded, TARGET), 1)
+        self.assertEqual(
+            app.forward_new_messages(folder, excluded, TARGET, self.sender), 1
+        )
 
         existing.Forward.assert_not_called()
         other.Forward.assert_not_called()
@@ -29,12 +36,16 @@ class ForwardingTests(unittest.TestCase):
         self.assertEqual(forwarded.To, TARGET)
         self.assertEqual(forwarded.CC, "")
         self.assertEqual(forwarded.BCC, "")
+        self.assertEqual(forwarded.SentOnBehalfOfName, "")
+        self.assertIs(forwarded.SendUsingAccount, self.sender)
         forwarded.Send.assert_called_once_with()
         new.Move.assert_not_called()
         self.assertEqual(folder.Items, [existing, other, new])
         self.assertEqual(excluded, {"existing", "new"})
 
-        self.assertEqual(app.forward_new_messages(folder, excluded, TARGET), 0)
+        self.assertEqual(
+            app.forward_new_messages(folder, excluded, TARGET, self.sender), 0
+        )
         forwarded.Send.assert_called_once_with()
 
     def test_multiple_messages_remain_in_folder(self):
@@ -44,9 +55,13 @@ class ForwardingTests(unittest.TestCase):
         folder = Mock(Items=items)
         excluded = set()
 
-        self.assertEqual(app.forward_new_messages(folder, excluded, TARGET), 3)
+        self.assertEqual(
+            app.forward_new_messages(folder, excluded, TARGET, self.sender), 3
+        )
         self.assertEqual(items, originals)
-        self.assertEqual(app.forward_new_messages(folder, excluded, TARGET), 0)
+        self.assertEqual(
+            app.forward_new_messages(folder, excluded, TARGET, self.sender), 0
+        )
         folder.Folders.Add.assert_not_called()
         for item in originals:
             item.Forward.return_value.Send.assert_called_once_with()
@@ -60,7 +75,7 @@ class ForwardingTests(unittest.TestCase):
         excluded = set()
 
         with self.assertRaisesRegex(RuntimeError, "送信失敗"):
-            app.forward_new_messages(Mock(Items=[item]), excluded, TARGET)
+            app.forward_new_messages(Mock(Items=[item]), excluded, TARGET, self.sender)
 
         item.Move.assert_not_called()
         self.assertEqual(excluded, set())
@@ -86,10 +101,59 @@ class ForwardingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "見つかりません"):
             app.get_folder(namespace, "Mailbox", ["Teams転送"])
 
+    def test_shared_folder_is_opened_by_email(self):
+        """共有アドレスから受信トレイを開き、その配下の監視フォルダーを取得する。"""
+        namespace = Mock()
+        recipient = namespace.CreateRecipient.return_value
+        recipient.Resolved = True
+        inbox = namespace.GetSharedDefaultFolder.return_value
+
+        result = app.get_folder(namespace, "", ["Teams転送"], "shared@example.com")
+
+        namespace.CreateRecipient.assert_called_once_with("shared@example.com")
+        recipient.Resolve.assert_called_once_with()
+        namespace.GetSharedDefaultFolder.assert_called_once_with(recipient, 6)
+        namespace.Folders.Item.assert_not_called()
+        inbox.Folders.Item.assert_called_once_with("Teams転送")
+        self.assertIs(result, inbox.Folders.Item.return_value)
+        self.assertIs(app.get_folder(namespace, "", [], "shared@example.com"), inbox)
+
+    def test_unresolved_shared_mailbox_is_rejected(self):
+        """共有アドレスの解決に失敗した場合、別の受信箱に切り替えず停止する。"""
+        namespace = Mock()
+        namespace.CreateRecipient.return_value.Resolved = False
+
+        with self.assertRaisesRegex(ValueError, "解決できません"):
+            app.get_folder(namespace, "", [], "shared@example.com")
+
+        namespace.GetSharedDefaultFolder.assert_not_called()
+        namespace.Folders.Item.assert_not_called()
+
+    def test_shared_folder_access_error_propagates(self):
+        """共有メールボックスへのアクセス拒否を握りつぶさない。"""
+        namespace = Mock()
+        namespace.CreateRecipient.return_value.Resolved = True
+        namespace.GetSharedDefaultFolder.side_effect = RuntimeError("アクセス拒否")
+
+        with self.assertRaisesRegex(RuntimeError, "アクセス拒否"):
+            app.get_folder(namespace, "", [], "shared@example.com")
+
+    def test_sender_account_is_selected_by_smtp_address(self):
+        """既定アカウントではなく指定した個人用アカウントを選択する。"""
+        namespace = Mock(Accounts=[Mock(SmtpAddress="other@example.com"), self.sender])
+        self.assertIs(app.get_sender_account(namespace, SENDER.upper()), self.sender)
+
+    def test_missing_sender_account_is_rejected(self):
+        """送信元が未登録なら既定アカウントにフォールバックしない。"""
+        with self.assertRaisesRegex(ValueError, "登録されていません"):
+            app.get_sender_account(Mock(Accounts=[]), SENDER)
+
     def test_monitor_excludes_startup_and_downtime_mail(self):
         """監視ループと再起動で既存メールを除外し、稼働中の追加分だけ転送する。"""
         win32com = Mock()
-        namespace = win32com.client.Dispatch.return_value.GetNamespace.return_value
+        outlook = win32com.client.gencache.EnsureDispatch.return_value
+        namespace = outlook.GetNamespace.return_value
+        namespace.Accounts = [self.sender]
         folder = namespace.Folders.Item.return_value.Folders.Item.return_value
         existing = Mock(Class=app.MAIL_ITEM, EntryID="existing")
         new = Mock(Class=app.MAIL_ITEM, EntryID="new")
@@ -101,6 +165,8 @@ class ForwardingTests(unittest.TestCase):
             "Teams転送",
             "--teams-email",
             TARGET,
+            "--sender-email",
+            SENDER,
         ]
 
         def wait_or_stop(_):
@@ -131,9 +197,63 @@ class ForwardingTests(unittest.TestCase):
         folder.Folders.Add.assert_not_called()
         self.assertEqual(folder.Items, [existing, new, downtime])
 
+    def test_shared_mail_is_forwarded_from_personal_account(self):
+        """共有受信箱を監視し、送信時点で個人用アカウントが設定されていることを確認する。"""
+        win32com = Mock()
+        outlook = win32com.client.gencache.EnsureDispatch.return_value
+        namespace = outlook.GetNamespace.return_value
+        namespace.Accounts = [Mock(SmtpAddress="other@example.com"), self.sender]
+        namespace.CreateRecipient.return_value.Resolved = True
+        folder = namespace.GetSharedDefaultFolder.return_value
+        item = Mock(Class=app.MAIL_ITEM, EntryID="shared-new")
+        folder.Items = []
+
+        def verify_sender():
+            """送信APIを呼ぶ前に個人用送信元を設定していることを検証する。"""
+            self.assertIs(item.Forward.return_value.SendUsingAccount, self.sender)
+            self.assertEqual(item.Forward.return_value.SentOnBehalfOfName, "")
+
+        item.Forward.return_value.Send.side_effect = verify_sender
+
+        def wait_or_stop(_):
+            """最初の待機で共有メールを追加し、転送後に監視を終了する。"""
+            if item.Forward.called:
+                raise KeyboardInterrupt
+            folder.Items.append(item)
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {"win32com": win32com, "win32com.client": win32com.client},
+            ),
+            patch.object(app.time, "sleep", side_effect=wait_or_stop),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            app.main(
+                [
+                    "--shared-mailbox",
+                    "shared@example.com",
+                    "--folder",
+                    "--sender-email",
+                    SENDER,
+                    "--teams-email",
+                    TARGET,
+                ]
+            )
+        item.Forward.return_value.Send.assert_called_once_with()
+        item.Move.assert_not_called()
+        namespace.Folders.Item.assert_not_called()
+        self.assertEqual(folder.Items, [item])
+
 
 class ConfigurationTests(unittest.TestCase):
     """コマンドライン引数の検証を行う。"""
+
+    def setUp(self):
+        """有効な送信元定数を設定し、各テスト後に元に戻す。"""
+        sender_patch = patch.object(app, "SENDER_EMAIL", SENDER)
+        sender_patch.start()
+        self.addCleanup(sender_patch.stop)
 
     def test_constants_are_used_without_arguments(self):
         """引数を省略すると定数の設定を利用する。"""
@@ -146,6 +266,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(args.mailbox, "定数のメールボックス")
         self.assertEqual(args.folder, ["受信トレイ", "定数のフォルダー"])
         self.assertEqual(args.teams_email, TARGET)
+        self.assertEqual(args.sender_email, SENDER)
 
     def test_invalid_constant_configuration(self):
         """定数の未設定と不正値も起動時に拒否する。"""
@@ -168,6 +289,35 @@ class ConfigurationTests(unittest.TestCase):
                 app.parse_args([])
             self.assertEqual(raised.exception.code, 2)
 
+    def test_shared_mailbox_constants(self):
+        """共有アドレスを指定した場合は表示名なしで受信トレイを監視できる。"""
+        with (
+            patch.object(app, "OUTLOOK_MAILBOX", ""),
+            patch.object(app, "SHARED_MAILBOX_EMAIL", "shared@example.com"),
+            patch.object(app, "OUTLOOK_FOLDER", ()),
+            patch.object(app, "TEAMS_CHANNEL_EMAIL", TARGET),
+        ):
+            args = app.parse_args([])
+        self.assertEqual(args.shared_mailbox, "shared@example.com")
+        self.assertEqual(args.folder, [])
+
+    def test_invalid_sender_and_shared_addresses(self):
+        """送信元の未設定と、不正な送信元・共有メールアドレスを拒否する。"""
+        for option, value in (
+            ("--sender-email", ""),
+            ("--sender-email", "invalid"),
+            ("--shared-mailbox", "invalid"),
+        ):
+            with (
+                self.subTest(option=option, value=value),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                app.parse_args(
+                    ["--mailbox", "Mailbox", "--teams-email", TARGET, option, value]
+                )
+            self.assertEqual(raised.exception.code, 2)
+
     def test_valid_configuration(self):
         """階層を含む有効な設定を受け取る。"""
         args = app.parse_args(
@@ -179,11 +329,14 @@ class ConfigurationTests(unittest.TestCase):
                 "Teams転送",
                 "--teams-email",
                 TARGET,
+                "--sender-email",
+                "override@example.com",
             ]
         )
         self.assertEqual(args.mailbox, "Mailbox")
         self.assertEqual(args.folder, ["受信トレイ", "Teams転送"])
         self.assertEqual(args.teams_email, TARGET)
+        self.assertEqual(args.sender_email, "override@example.com")
 
     def test_invalid_configuration(self):
         """未設定・空白・複数宛先・不正アドレスで起動を拒否する。"""

@@ -12,8 +12,12 @@
 - Teamsチャネルで「メールアドレスを取得」が利用でき、メール受信が許可されていること。
   Teams側の許可された送信元や、組織のメール転送ポリシーも確認してください。
 - 監視するメールボックス・フォルダーへのアクセス権限。
-  送信にはOutlookの既定アカウントを利用します。共有メールボックスからの代理送信設定は
-  このPoCの対象外です。
+  共有メールボックスを監視する場合は、Exchange / Microsoft 365上の共有受信トレイと
+  対象サブフォルダーの読み取り権限が必要です。配布リストや別名アドレスだけでは、
+  独立した共有メールボックスとして開けません。
+- 送信に使用する個人用アカウントを、同じOutlookプロファイルに登録しておくこと。
+  SMTPアドレスで送信アカウントを明示的に選びます。共有アドレスからの代理送信や
+  「差出人として送信」は使用しません。
 
 ## 準備
 
@@ -35,18 +39,42 @@ Outlookで「受信トレイ」の下に「Teams転送」フォルダーを作�
 `outlook_to_teams.py`の先頭にある定数を編集してください。
 転送先は**チャンネルIDではなく、Teamsチャネルで取得したメールアドレス**です。
 
+個人メールボックスなど、Outlook左ペインの最上位に表示される受信箱を監視する設定です。
+
 ```python
 OUTLOOK_MAILBOX = "Outlookに表示されるメールボックス名"
+SHARED_MAILBOX_EMAIL = ""
 OUTLOOK_FOLDER = ("受信トレイ", "Teams転送")
+SENDER_EMAIL = "personal@example.com"
 TEAMS_CHANNEL_EMAIL = "channel@example.com"
 ```
 
 `OUTLOOK_MAILBOX`にはOutlook左ペインの最上位の表示名を、
 `OUTLOOK_FOLDER`にはその配下から監視フォルダーまでの名前を階層順に指定します。
 最上位直下なら`("Teams転送",)`です。末尾のカンマを付けてください。
+`SENDER_EMAIL`は送信元の個人用アカウントのSMTPアドレス、
 `TEAMS_CHANNEL_EMAIL`は実際のチャネルのメールアドレス1件に置き換えてください。
-メールボックス名・メールアドレスの初期値は空で、未設定の場合は起動時にエラーになります。
+必須の設定が空のままの場合は、起動時にエラーになります。
 認証情報の入力や`.env`の作成は不要です。
+
+共有メールボックスのメールを個人用アカウントから転送する場合は、次のように設定します。
+
+```python
+OUTLOOK_MAILBOX = ""
+SHARED_MAILBOX_EMAIL = "shared@example.com"
+OUTLOOK_FOLDER = ("Teams転送",)
+SENDER_EMAIL = "personal@example.com"
+TEAMS_CHANNEL_EMAIL = "channel@example.com"
+```
+
+`SHARED_MAILBOX_EMAIL`を指定すると、表示名ではなく共有アドレスを解決して、
+その共有受信トレイを開きます。`OUTLOOK_MAILBOX`は使用しません。
+この場合の`OUTLOOK_FOLDER`は**共有受信トレイからの相対階層**で、
+`"受信トレイ"`は含めません。共有受信トレイ自体を監視する場合は`()`にします。
+共有受信トレイ以外のフォルダーを指定したい場合は、Outlookに追加済みの
+メールボックスを`OUTLOOK_MAILBOX`で指定する方式を使用してください。
+1回の起動で監視するフォルダーは1つです。個人用と共有の両方を同時に監視する場合は、
+異なる対象フォルダーを指定した別プロセスで実行します。
 
 設定後は引数なしで実行できます。
 
@@ -60,8 +88,23 @@ uv run python .\outlook_to_teams.py
 uv run python .\outlook_to_teams.py `
   --mailbox "Outlookに表示されるメールボックス名" `
   --folder "受信トレイ" "Teams転送" `
+  --sender-email "personal@example.com" `
   --teams-email "チャネルのメールアドレスに置き換えてください"
 ```
+
+共有受信トレイ配下の例です。
+
+```powershell
+uv run python .\outlook_to_teams.py `
+  --shared-mailbox "shared@example.com" `
+  --folder "Teams転送" `
+  --sender-email "personal@example.com" `
+  --teams-email "channel@example.com"
+```
+
+共有受信トレイ自体を監視する場合は、`--folder`の直後に名前を付けず、
+次のオプションへ進みます。共有の定数設定を通常の監視へ戻す場合は、
+`SHARED_MAILBOX_EMAIL = ""`に戻し、`OUTLOOK_MAILBOX`と階層も設定し直してください。
 
 `--teams-email`には実際のメールアドレスを1件だけ指定してください。
 `--mailbox`にはOutlook左ペインの最上位の表示名を指定します。
@@ -85,6 +128,9 @@ uv run python .\outlook_to_teams.py `
   **同じフォルダーを監視するプログラムを多重起動しないでください。**
 - Outlookのセキュリティ設定によっては送信確認が表示されます。
   ポリシーを無断で変更せず、管理者へ確認してください。
+- 指定した個人用の送信アカウントが見つからない場合や、共有アドレスを解決できない場合、
+  共有受信トレイへアクセスできない場合は停止します。別の受信箱や既定の送信元に
+  自動で切り替えることはありません。別のOutlookプロファイルへの切り替えは対象外です。
 - `Send()`はOutlookへの送信依頼であり、Teamsへの配信完了ではありません。
   オフライン時は送信トレイに残ることがあります。送信トレイ・送信済みアイテム・
   配信不能通知・Teamsの投稿を別途確認してください。
@@ -116,6 +162,9 @@ uv run python -m compileall -q outlook_to_teams.py tests
 本文と添付ファイルが期待どおりであることを確認してください。
 そのまま複数回の監視間隔を待ち、二重投稿されないことも確認します。
 停止中に追加したメールが再起動後も対象外になることを確認してください。
+個人メールボックスと共有メールボックスの両方で確認し、共有メールの転送でも
+差出人が`SENDER_EMAIL`の個人用アドレスになっていることを確認してください。
+共有受信箱の読み取り権限がない場合や送信元が未登録の場合に停止することも確認します。
 単体テストはCOMをモックしており、実際のOutlook送信やTeams配信の成功は保証しません。
 
 ---
